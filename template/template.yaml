@@ -1,25 +1,8 @@
 #INCLUDEFILE false
 options:
-  - !Category
-    name: chip
-    display_name: Chip selection
-    help: Target Espressif chip. Switching chip hides options whose `compatible` allow-list
-      excludes the new chip and clears their selection.
-    options:
-      - !Option
-        name: PLACEHOLDER
-        display_name: "<dynamic - will be replaced at runtime>"
-        selection_group: chip
+  - !Include .template/chip.yaml
 
-  - !Category
-    name: module
-    display_name: Module/Board selection
-    help: Select your specific ESP32 module. This selection is optional, but it will generate code to help you avoid using reserved GPIOs.
-    options:
-      - !Option
-        name: PLACEHOLDER
-        display_name: "<dynamic - will be replaced at runtime>"
-        selection_group: module
+  - !Include .template/module.yaml
 
   - !Option
     name: unstable-hal
@@ -223,6 +206,6 @@ options:
     display_name: Rust toolchain
     options:
       - !Option
-        name:
+        name: ""
         display_name: "Scanning installed toolchains..."
         selection_group: toolchain

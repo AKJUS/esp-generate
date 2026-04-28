@@ -1,7 +1,7 @@
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 use esp_generate::Chip;
-use esp_generate::template::{GeneratorOption, GeneratorOptionItem, Template};
+use esp_generate::template::{GeneratorOption, GeneratorOptionItem, SetValue, Template};
 use esp_generate::{
     append_list_as_sentence,
     config::{ActiveConfiguration, Relationships},
@@ -26,21 +26,36 @@ use std::{
 use strum::IntoEnumIterator;
 use taplo::formatter::Options;
 
-use crate::template_files::TEMPLATE_FILES;
+use esp_generate::template_files::TEMPLATE_FILES;
 
 mod check;
-mod template_files;
+mod chip_selector;
 mod toolchain;
 mod tui;
 
 static TEMPLATE: LazyLock<Template> = LazyLock::new(|| {
-    serde_yaml::from_str(
-        template_files::TEMPLATE_FILES
+    // Load `template.yaml` as the root and resolve every `!Include <path>`
+    // against the bundled `TEMPLATE_FILES` table. This is the one place
+    // that knows how include paths map onto real files; the rest of the
+    // generator sees an already-flattened tree.
+    let root_yaml = TEMPLATE_FILES
+        .iter()
+        .find_map(|(k, v)| (*k == "template.yaml").then_some(*v))
+        .expect("bundled templates missing template.yaml");
+
+    let template = Template::load(root_yaml, |path| {
+        TEMPLATE_FILES
             .iter()
-            .find_map(|(k, v)| if *k == "template.yaml" { Some(v) } else { None })
-            .unwrap(),
-    )
-    .unwrap()
+            .find_map(|(k, v)| (*k == path).then(|| v.to_string()))
+    })
+    .expect("failed to load bundled template");
+
+    // The `chip` category is authored in YAML but must stay aligned with the
+    // `Chip` enum for the generator to work.
+    chip_selector::validate_chip_category(&template.options)
+        .expect("invalid `chip` category in bundled template");
+
+    template
 });
 
 #[derive(Parser, Debug)]
@@ -154,22 +169,7 @@ impl SubCommands {
             }
         }
 
-        // Populate the `chip` category so chips show up under their real
-        // names (`esp32c6` etc.) rather than the static `PLACEHOLDER` entry
-        // that ships in the YAML. The chip is a valid `-o` target now, so
-        // `list-options`/`explain` must be able to describe it.
-        //
-        // `module` and `toolchain` are intentionally *not* populated here:
-        // modules are chip-specific (so a chip-agnostic listing has nothing
-        // useful to say) and toolchains are discovered from the user's
-        // rustup install at runtime. Those two groups are filtered out of
-        // the listing below instead.
-        let mut populated_options = TEMPLATE.options.clone();
-        esp_generate::chip_selector::populate_chip_category(&mut populated_options);
-        let populated = Template {
-            options: populated_options,
-        };
-
+        let all_options = TEMPLATE.all_options();
         match self {
             SubCommands::ListOptions => {
                 println!(
@@ -177,7 +177,6 @@ impl SubCommands {
                 );
                 let mut groups = IndexMap::new();
                 let mut seen = HashSet::new();
-                let all_options = populated.all_options();
                 for (index, option) in all_options
                     .iter()
                     .enumerate()
@@ -218,7 +217,6 @@ impl SubCommands {
                 Ok(())
             }
             SubCommands::Explain { option } => {
-                let all_options = populated.all_options();
                 if let Some(option) = all_options.iter().find(|o| &o.name == option) {
                     println!(
                         "Option: {}\n\n{}{}",
@@ -659,14 +657,11 @@ fn main() -> Result<()> {
         selected.push("toolchain-selected".to_string());
     }
 
-    let wokwi_devkit = chip.wokwi();
-
     let max_dram2 = chip.dram2_region().size();
 
     let mut variables = vec![
         ("project-name".to_string(), name.clone()),
         ("mcu".to_string(), chip.to_string()),
-        ("wokwi-board".to_string(), wokwi_devkit.to_string()),
         (
             "generate-version".to_string(),
             env!("CARGO_PKG_VERSION").to_string(),
@@ -675,6 +670,27 @@ fn main() -> Result<()> {
         ("esp-hal-version-full".to_string(), esp_hal_version_full),
         ("max-dram2-uninit".to_string(), format!("{max_dram2}")),
     ];
+
+    // Merge scalar `sets` entries contributed by the selected options (e.g.
+    // the chip-group option contributes `wokwi-board`). Generator-provided
+    // variables above take precedence — `#REPLACE` lookup is first-match-wins
+    // — so a template author can't accidentally shadow `project-name` /
+    // `mcu` / etc. by declaring them in an option's `sets`.
+    //
+    // List-valued entries (e.g. `remove_pins`) aren't substitutable text and
+    // are consumed directly by the code-generation paths that know what to
+    // do with them (see the pin-reservation block below), so they're
+    // deliberately skipped here instead of being joined into a string.
+    for name in &selected {
+        let Some((_, opt)) = find_option(name, &flat_options, chip) else {
+            continue;
+        };
+        for (key, value) in &opt.sets {
+            if let Some(scalar) = value.as_scalar() {
+                variables.push((key.clone(), scalar.to_string()));
+            }
+        }
+    }
 
     variables.push((
         "rust_target".to_string(),
@@ -688,12 +704,20 @@ fn main() -> Result<()> {
     let mut reserved_gpio_code = String::new();
 
     if let Some(ref module_name) = selected_module {
-        if let Some(module) = chip.module_by_name(module_name) {
+        if let Some((_, module_option)) = find_option(module_name, &flat_options, chip) {
+            // The module option carries its limitation tags as a list-valued
+            // `sets` entry; a missing entry means "no pins to reserve", not
+            // an error — e.g. a chip-specific module with nothing special
+            // about its wiring.
+            let remove_pins = module_option
+                .sets
+                .get("remove_pins")
+                .and_then(SetValue::as_list)
+                .unwrap_or(&[]);
             let restricted_pins = chip.pins().iter().filter(|pin| {
-                module
-                    .remove_pins
+                remove_pins
                     .iter()
-                    .any(|lim| pin.limitations.contains(lim))
+                    .any(|lim| pin.limitations.contains(&lim.as_str()))
             });
             let strapping_pins = chip
                 .pins()
@@ -738,7 +762,7 @@ fn main() -> Result<()> {
     let project_dir = path.join(&name);
     fs::create_dir(&project_dir)?;
 
-    for &(file_path, contents) in template_files::TEMPLATE_FILES.iter() {
+    for &(file_path, contents) in TEMPLATE_FILES.iter() {
         let mut file_path = file_path.to_string();
         if let Some(processed) = process_file(contents, &selected, &variables, &mut file_path) {
             let file_path = project_dir.join(file_path);
@@ -828,10 +852,14 @@ fn prune_chip_incompatible_options(chip: Chip, options: &mut Vec<GeneratorOption
 /// [`TEMPLATE`].
 ///
 /// Applies, in order:
-///   1. chip-compat pruning (`prune_chip_incompatible_options`),
-///   2. module-category population (`modules::populate_module_category`),
-///   3. toolchain-category population (`ToolchainCategory::populate`), if a
+///   1. chip-compat pruning (`prune_chip_incompatible_options`), which
+///      also hides modules whose `compatible.chip` excludes this chip,
+///   2. toolchain-category population (`ToolchainCategory::populate`), if a
 ///      `ToolchainCategory` was captured off the original template.
+///
+/// The `chip` and `module` categories are both authored statically in
+/// `template.yaml` and validated once at [`TEMPLATE`] load; no runtime
+/// population is needed for either.
 ///
 /// This is the single place that knows how to turn "chip + current toolchain
 /// list" into a ready-to-use options tree, and it is deliberately cheap enough
@@ -844,8 +872,6 @@ fn build_options_for_chip(
 ) -> Vec<GeneratorOptionItem> {
     let mut options = TEMPLATE.options.clone();
     prune_chip_incompatible_options(chip, &mut options);
-    esp_generate::chip_selector::populate_chip_category(&mut options);
-    esp_generate::modules::populate_module_category(chip, &mut options);
     if let Some(category) = toolchain_category {
         category.populate(&mut options, toolchains);
     }

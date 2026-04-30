@@ -43,11 +43,10 @@ pub struct Repository {
 }
 
 impl Repository {
-    pub fn new(chip: Chip, options: Vec<GeneratorOptionItem>, selected: &[String]) -> Self {
+    pub fn new(options: Vec<GeneratorOptionItem>, selected: &[String]) -> Self {
         let flat_options = flatten_options(&options);
         Self {
             config: ActiveConfiguration {
-                chip,
                 selected: selected
                     .iter()
                     .flat_map(|option| flat_options.iter().position(|o| &o.name == option))
@@ -59,7 +58,7 @@ impl Repository {
         }
     }
 
-    /// Rebuild the options tree for a (possibly different) chip.
+    /// Rebuild the options tree.
     ///
     /// The `options` argument is the *fully prepared* tree: the caller is
     /// responsible for running chip-filtering, module population and toolchain
@@ -68,12 +67,10 @@ impl Repository {
     /// keep my state consistent" primitive.
     ///
     /// The menu path is trimmed to the depth that still resolves against the
-    /// new tree rather than reset wholesale, so callers that repopulate a
-    /// single category on the *same* chip (notably the toolchain scan) keep
-    /// their cursor where it is; callers that truly switch chips typically
-    /// want to [`Self::reset_path`] after this.
-    pub fn set_options(&mut self, chip: Chip, options: Vec<GeneratorOptionItem>) {
-        self.config.reset_options(chip, options);
+    /// new tree, so categories that vanish drop out while surviving ones keep
+    /// the user's cursor in place.
+    pub fn set_options(&mut self, options: Vec<GeneratorOptionItem>) {
+        self.config.reset_options(options);
 
         // Trim the navigation path to whatever still resolves in the new tree.
         let mut current: &[GeneratorOptionItem] = &self.config.options;
@@ -90,12 +87,6 @@ impl Repository {
         self.path.truncate(valid_depth);
     }
 
-    /// Collapse the menu path back to the root. Intended for callers that have
-    /// just switched chip and want the UI to start from a known location.
-    pub fn reset_path(&mut self) {
-        self.path.clear();
-    }
-
     /// Returns the *explicitly* selected toolchain, if there is any
     fn selected_toolchain(&self) -> Option<String> {
         self.config.selected.iter().find_map(|idx| {
@@ -109,13 +100,9 @@ impl Repository {
     }
 
     /// Returns the chip that is currently ticked in the `chip` selection
-    /// group, if any. The main loop polls this after every event to detect
-    /// user-driven chip switches; disagreement with [`ActiveConfiguration::chip`]
-    /// triggers a full options-tree rebuild.
-    ///
-    /// Returns `None` only in degenerate situations (e.g. tests that build a
-    /// `Repository` without a chip category). Callers should fall back to
-    /// `self.config.chip` in that case.
+    /// group, if any. Returns `None` only in degenerate situations (e.g. tests
+    /// that build a `Repository` without a chip category, or the user hasn't
+    /// picked a chip yet).
     pub fn selected_chip(&self) -> Option<Chip> {
         self.config.selected.iter().find_map(|idx| {
             let option = &self.config.flat_options[*idx];
@@ -189,9 +176,10 @@ impl Repository {
     fn is_item_visible(&self, item: &GeneratorOptionItem) -> bool {
         match item {
             GeneratorOptionItem::Option(option) => self.config.is_option_compatible(option),
-            GeneratorOptionItem::Category(category) => {
-                category.options.iter().any(|child| self.is_item_visible(child))
-            }
+            GeneratorOptionItem::Category(category) => category
+                .options
+                .iter()
+                .any(|child| self.is_item_visible(child)),
         }
     }
 
@@ -552,10 +540,14 @@ pub struct App {
     ui_elements: UiElements,
     colors: Colors,
     toolchains_loading: bool,
+    /// Selection groups that must have an option picked before
+    /// `s`/`S` actually triggers generation. Sourced from
+    /// [`esp_generate::template::Template::required`].
+    required_groups: Vec<String>,
 }
 
 impl App {
-    pub fn new(repository: Repository) -> Self {
+    pub fn new(repository: Repository, required_groups: Vec<String>) -> Self {
         let mut initial_state = ListState::default();
         initial_state.select(Some(0));
 
@@ -572,7 +564,25 @@ impl App {
             ui_elements,
             colors,
             toolchains_loading: false,
+            required_groups,
         }
+    }
+
+    /// Required selection groups that currently have no option selected in
+    /// the live tree. Empty iff every required group has a pick — the
+    /// gate [`Self::can_save`] uses to allow `s`/`S` to trigger generation.
+    pub fn missing_required_groups(&self) -> Vec<String> {
+        self.repository
+            .config
+            .missing_required_groups(&self.required_groups)
+    }
+
+    /// True when every required selection group has at least one option
+    /// selected. The `s`/`S` key is a no-op while this returns `false`;
+    /// the footer surfaces which groups are still missing so the user
+    /// knows why Save is gated.
+    pub fn can_save(&self) -> bool {
+        self.missing_required_groups().is_empty()
     }
     pub fn selected(&self) -> usize {
         if let Some(current) = self.state.last() {
@@ -610,34 +620,15 @@ impl App {
     ///
     /// `Repository::set_options` trims the navigation path to whatever still
     /// resolves in the new tree; we mirror that here on the `ListState` stack.
-    /// When the caller asks for a path reset (the typical chip-switch case),
-    /// we also collapse back to the root menu with a fresh selection at the
-    /// top so the user isn't dropped inside a now-unrelated category.
-    pub fn set_options(
-        &mut self,
-        chip: Chip,
-        options: Vec<GeneratorOptionItem>,
-        reset_path: bool,
-    ) {
-        self.repository.set_options(chip, options);
-        if reset_path {
-            self.repository.reset_path();
-        }
+    pub fn set_options(&mut self, options: Vec<GeneratorOptionItem>) {
+        self.repository.set_options(options);
 
-        // The state stack is always `path_len + 1` — one for the root level,
-        // one per entered category. Truncate mirrors the path trim; the min-1
-        // floor guarantees we always have a state for the visible level.
         let desired = self.repository.path_len() + 1;
         self.state.truncate(desired.max(1));
         if self.state.is_empty() {
             let mut fresh = ListState::default();
             fresh.select(Some(0));
             self.state.push(fresh);
-        }
-        if reset_path
-            && let Some(last) = self.state.last_mut()
-        {
-            last.select(Some(0));
         }
     }
     pub fn selected_options(&self) -> Vec<String> {
@@ -715,6 +706,48 @@ mod test {
         }
     }
 
+    fn app_with(required: &[&str], repository: Repository) -> super::App {
+        super::App::new(repository, required.iter().map(|s| s.to_string()).collect())
+    }
+
+    #[test]
+    fn save_is_gated_on_required_group_picks() {
+        // Mirrors the real `chip` required-group wiring: while no option
+        // from the required group is selected, `can_save` must report
+        // false and `missing_required_groups` must name the group. The
+        // moment a matching option is selected, both flip.
+        let options = vec![
+            chip_group_option(Chip::Esp32),
+            chip_group_option(Chip::Esp32c6),
+            option("alloc", &[]),
+        ];
+        let repository = Repository::new(options, &["alloc".to_string()]);
+        let mut app = app_with(&["chip"], repository);
+
+        assert!(
+            !app.can_save(),
+            "unsatisfied required group must block save"
+        );
+        assert_eq!(app.missing_required_groups(), vec!["chip".to_string()]);
+
+        // Simulate the user ticking `esp32` in the chip group (`toggle_current`
+        // treats the chip radio as non-deselect, so the selection sticks).
+        app.repository.toggle_current(0);
+        assert!(app.can_save(), "required group satisfied — save unlocked");
+        assert!(app.missing_required_groups().is_empty());
+    }
+
+    #[test]
+    fn required_groups_list_is_empty_when_nothing_is_required() {
+        // No `required` entries → Save is never gated, regardless of
+        // selection state. This is the fallback for templates that don't
+        // opt into the mechanism.
+        let repository = Repository::new(vec![option("alloc", &[])], &[]);
+        let app = app_with(&[], repository);
+        assert!(app.can_save());
+        assert!(app.missing_required_groups().is_empty());
+    }
+
     #[test]
     fn toggling_method_clears_other_side_without_restoring_on_toggle_back() {
         // Mirrors the espflash ↔ probe-rs scenario: selecting `method` kicks out all
@@ -729,7 +762,6 @@ mod test {
         ];
 
         let mut repository = Repository::new(
-            Chip::Esp32,
             options,
             &[
                 "method-unselected-a".to_string(),
@@ -769,12 +801,8 @@ mod test {
         ];
 
         let repository = Repository::new(
-            Chip::Esp32,
             options,
-            &[
-                "method".to_string(),
-                "dependent".to_string(),
-            ],
+            &["method".to_string(), "dependent".to_string()],
         );
 
         let ui = plain_ui();
@@ -850,18 +878,14 @@ mod test {
             option("method", &[]),
             option("unmet-pos", &["needs-x", "!method"]),
         ];
-        let repository = Repository::new(Chip::Esp32, options, &["method".to_string()]);
+        let repository = Repository::new(options, &["method".to_string()]);
 
         let (actionable, line) = repository
             .current_level_desc(80, &ui, Some(1))
             .into_iter()
             .nth(1)
             .unwrap();
-        let text: String = line
-            .spans
-            .iter()
-            .map(|s| s.content.to_string())
-            .collect();
+        let text: String = line.spans.iter().map(|s| s.content.to_string()).collect();
         assert!(
             !actionable,
             "unmet-pos row must report as non-actionable, got: {text:?}"
@@ -894,7 +918,6 @@ mod test {
             }),
         ];
         let repository = Repository::new(
-            Chip::Esp32,
             options,
             &["esp32".to_string(), "method".to_string()],
         );
@@ -931,7 +954,6 @@ mod test {
         ];
 
         let repository = Repository::new(
-            Chip::Esp32,
             options,
             &[
                 "loooooong-one".to_string(),
@@ -978,8 +1000,8 @@ mod test {
         //   * drop selections whose option was removed (remap-by-name),
         //   * cascade out anything whose requirements are now unmet,
         //   * trim `path` to whatever still resolves in the new tree.
-        let initial = vec![
-            GeneratorOptionItem::Category(esp_generate::template::GeneratorOptionCategory {
+        let initial = vec![GeneratorOptionItem::Category(
+            esp_generate::template::GeneratorOptionCategory {
                 name: "cat".to_string(),
                 display_name: "cat".to_string(),
                 help: String::new(),
@@ -989,11 +1011,10 @@ mod test {
                     option("will-vanish", &[]),
                     option("dependent", &["will-vanish"]),
                 ],
-            }),
-        ];
+            },
+        )];
 
         let mut repository = Repository::new(
-            Chip::Esp32,
             initial,
             &[
                 "survivor".to_string(),
@@ -1008,19 +1029,21 @@ mod test {
         // New tree for a "different chip" — `will-vanish` is gone; the category
         // itself is preserved so the path stays valid. `dependent` has its
         // required option removed so it must cascade out.
-        let rebuilt = vec![
-            GeneratorOptionItem::Category(esp_generate::template::GeneratorOptionCategory {
+        let rebuilt = vec![GeneratorOptionItem::Category(
+            esp_generate::template::GeneratorOptionCategory {
                 name: "cat".to_string(),
                 display_name: "cat".to_string(),
                 help: String::new(),
                 requires: Vec::new(),
-                options: vec![option("survivor", &[]), option("dependent", &["will-vanish"])],
-            }),
-        ];
+                options: vec![
+                    option("survivor", &[]),
+                    option("dependent", &["will-vanish"]),
+                ],
+            },
+        )];
 
-        repository.set_options(Chip::Esp32c6, rebuilt);
+        repository.set_options(rebuilt);
 
-        assert_eq!(repository.config.chip, Chip::Esp32c6);
         assert!(repository.config.is_selected("survivor"));
         // Name no longer exists in the new tree: remap-by-name drops it.
         assert!(!repository.config.is_selected("will-vanish"));
@@ -1031,18 +1054,16 @@ mod test {
 
         // Now rebuild with the category itself gone: path must be trimmed.
         let reshaped = vec![option("survivor", &[])];
-        repository.set_options(Chip::Esp32c6, reshaped);
+        repository.set_options(reshaped);
         assert_eq!(repository.path.len(), 0);
         assert!(repository.config.is_selected("survivor"));
     }
 
     #[test]
     fn selected_chip_reports_chip_group_selection() {
-        // `selected_chip` is the bridge the main loop uses to notice user-driven
-        // chip switches. It must return the chip whose group entry is currently
-        // ticked, regardless of what `config.chip` says (divergence is the
-        // whole point — that's how we detect a pending switch), and `None`
-        // when no chip-group option is present in the tree at all.
+        // `selected_chip` returns the chip whose group entry is currently
+        // ticked, and `None` when no chip-group option is present in the tree
+        // at all.
         let options = vec![
             chip_group_option(Chip::Esp32),
             chip_group_option(Chip::Esp32c6),
@@ -1050,20 +1071,13 @@ mod test {
         ];
 
         let repository = Repository::new(
-            Chip::Esp32,
             options,
             &["esp32c6".to_string(), "alloc".to_string()],
         );
 
-        // config.chip still says Esp32 (the tree hasn't been rebuilt yet) but
-        // the user has ticked `esp32c6` in the chip group — the main loop
-        // picks this up and triggers the rebuild.
-        assert_eq!(repository.config.chip, Chip::Esp32);
         assert_eq!(repository.selected_chip(), Some(Chip::Esp32c6));
 
-        // A tree without a chip category means no chip group selection —
-        // falls back to `None`, which the main loop maps to `config.chip`.
-        let no_chip_group = Repository::new(Chip::Esp32, vec![option("alloc", &[])], &[]);
+        let no_chip_group = Repository::new(vec![option("alloc", &[])], &[]);
         assert_eq!(no_chip_group.selected_chip(), None);
     }
 
@@ -1077,8 +1091,7 @@ mod test {
             chip_group_option(Chip::Esp32),
             chip_group_option(Chip::Esp32c6),
         ];
-        let mut repository =
-            Repository::new(Chip::Esp32, options, &["esp32".to_string()]);
+        let mut repository = Repository::new(options, &["esp32".to_string()]);
 
         repository.toggle_current(0);
         assert!(
@@ -1120,7 +1133,6 @@ mod test {
         ];
 
         let repository = Repository::new(
-            Chip::Esp32,
             options,
             &[
                 "esp32".to_string(),
@@ -1188,7 +1200,6 @@ mod test {
         ];
 
         let mut repository = Repository::new(
-            Chip::Esp32,
             initial,
             &[
                 "esp32".to_string(),
@@ -1197,7 +1208,7 @@ mod test {
             ],
         );
 
-        // Rebuild for the new chip as if `build_options_for_chip(Esp32c6, …)`
+        // Rebuild for the new chip as if `build_options({chip: "esp32c6"}, …)`
         // had been called: `only-on-esp32` is gone, the chip group still
         // carries both entries (it's chip-agnostic), and the user has now
         // ticked `esp32c6`.
@@ -1213,17 +1224,14 @@ mod test {
         repository.toggle_current(1);
         assert_eq!(repository.selected_chip(), Some(Chip::Esp32c6));
 
-        repository.set_options(Chip::Esp32c6, rebuilt);
+        repository.set_options(rebuilt);
 
-        assert_eq!(repository.config.chip, Chip::Esp32c6);
         assert!(repository.config.is_selected("esp32c6"));
         assert!(!repository.config.is_selected("esp32"));
         assert!(repository.config.is_selected("shared"));
         // Chip-filtered out of the tree entirely; rebuild-by-name drops it.
         assert!(!repository.config.is_selected("only-on-esp32"));
-        // And `selected_chip()` now agrees with `config.chip` — no more
-        // pending switch.
-        assert_eq!(repository.selected_chip(), Some(repository.config.chip));
+        assert_eq!(repository.selected_chip(), Some(Chip::Esp32c6));
     }
 }
 
@@ -1243,7 +1251,7 @@ impl App {
 
                 match key.code {
                     Char('q') => self.confirm_quit = true,
-                    Char('s') | Char('S') => {
+                    Char('s') | Char('S') if self.can_save() => {
                         return Ok(AppResult::Save);
                     }
                     Esc => {
@@ -1457,17 +1465,31 @@ impl App {
     }
 
     fn footer_paragraph(&self) -> Paragraph<'_> {
-        let text = if self.confirm_quit {
+        let base = if self.confirm_quit {
             "Are you sure you want to quit? (y/N)"
         } else {
             "Use ↓↑ to move, ESC/← to go up, → to go deeper or change the value, s/S to save and generate, ESC/q to cancel"
         };
 
-        let text = if self.toolchains_loading {
-            format!("{text}  |  Scanning installed toolchains…")
-        } else {
-            text.to_string()
-        };
+        let mut text = base.to_string();
+        if self.toolchains_loading {
+            text.push_str("  |  Scanning installed toolchains…");
+        }
+
+        // Surface the Save gate before anything else: when a required
+        // selection group has no pick yet, `s`/`S` won't do anything, and
+        // the user deserves to know which group is holding them up. The
+        // confirm-quit prompt takes precedence so the user isn't trying
+        // to read two different instructions at once.
+        if !self.confirm_quit {
+            let missing = self.missing_required_groups();
+            if !missing.is_empty() {
+                text.push_str(&format!(
+                    "  |  Cannot save yet — pick one option from: {}",
+                    missing.join(", ")
+                ));
+            }
+        }
 
         Paragraph::new(text)
             .centered()

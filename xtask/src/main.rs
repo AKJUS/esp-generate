@@ -34,11 +34,11 @@ const IGNORED_CATEGORIES_FULL: &[&str] = &[
     "module",
 ];
 
-/// Mirror of `esp_generate::main::prune_chip_incompatible_options`'s predicate:
-/// an option is considered chip-compatible when it either has no `compatible:
+/// Minimal chip-compat predicate for the xtask's test-case fanout: an
+/// option is considered chip-compatible when it either has no `compatible:
 /// { chip: [...] }` constraint at all, or its allow-list contains the given
-/// chip. Other `compatible` entries aren't evaluated here — like the binary,
-/// the xtask only applies chip-based filtering at the tree-shaping layer.
+/// chip. Other `compatible` entries aren't evaluated here — the xtask only
+/// needs chip-based filtering to seed its per-chip test matrix.
 fn is_chip_compatible(option: &GeneratorOption, chip: Chip) -> bool {
     match option.compatible.get("chip") {
         None => true,
@@ -210,7 +210,7 @@ fn enable_config_and_dependencies(
     option: &str,
     chip: Chip,
 ) -> Result<()> {
-    let (idx, option) = find_option(option, &config.flat_options, chip)
+    let (idx, option) = find_option(option, &config.flat_options)
         .ok_or_else(|| anyhow::anyhow!("Option not found: {option}"))?;
 
     if config.selected.contains(&idx) {
@@ -351,10 +351,9 @@ fn options_for_chip(chip: Chip, all_combinations: bool) -> Result<Vec<Vec<String
 
     for base_template in &template_selectors {
         for option in &all_options {
-            let (_, option) = find_option(&option, &flat_options, chip)
+            let (_, option) = find_option(&option, &flat_options)
                 .unwrap_or_else(|| panic!("Option not found: {}", option));
             let mut config = ActiveConfiguration {
-                chip,
                 selected: vec![chip_idx],
                 flat_options: flat_options.clone(),
                 options: template.options.clone(),
@@ -409,7 +408,6 @@ fn options_for_chip(chip: Chip, all_combinations: bool) -> Result<Vec<Vec<String
             .cloned()
             .collect();
         let mut config = ActiveConfiguration {
-            chip,
             selected,
             options: template_options.take().unwrap(),
             flat_options: flat_options.take().unwrap(),
